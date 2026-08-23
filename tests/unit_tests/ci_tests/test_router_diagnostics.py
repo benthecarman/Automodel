@@ -151,3 +151,75 @@ def test_capture_hf_routers_supports_in_tree_minimax_m2(tmp_path):
     assert layer["score_func"] == "sigmoid"
     # The instance patch is removed once the capture context exits.
     assert "forward" not in model.model.layers[0].mlp.gate.__dict__
+
+
+def test_minimax_capture_and_compare_roundtrip(tmp_path):
+    """HF and AutoModel MiniMax captures must flow through the compare step.
+
+    Regression: the AutoModel Gate reports MiniMax's n_expert_groups=0 and the
+    compare step requires the normalized 1-group form (pipeline 64176861).
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausalLM
+    from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+        capture_glm_automodel_routers,
+        capture_glm_hf_routers,
+    )
+
+    tiny = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        rotary_dim=16,
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        max_position_embeddings=128,
+    )
+    hf_config = AutoConfig.for_model("minimax_m2", **tiny)
+    hf_model = AutoModelForCausalLM.from_config(hf_config).float().eval()
+
+    am_config = AutoConfig.for_model("minimax_m2", torch_dtype="float32", **tiny)
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        rope_fusion=False,
+        dispatcher="torch",
+        experts="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    am_model = MiniMaxM2ForCausalLM(am_config, backend=backend).eval()
+
+    # input_ids: Tensor of shape [batch, sequence] with 8 tokens.
+    input_ids = torch.randint(0, tiny["vocab_size"], (1, 8))
+    hf_path, am_path, report_path = tmp_path / "hf.pt", tmp_path / "am.pt", tmp_path / "report.json"
+
+    with capture_glm_hf_routers(hf_model, hf_path):
+        with torch.no_grad():
+            hf_logits = hf_model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids)).logits
+    with capture_glm_automodel_routers(am_model, am_path):
+        with torch.no_grad():
+            am_logits = am_model(input_ids).logits
+
+    am_payload = torch.load(am_path, weights_only=True)
+    assert am_payload["model_family"] == "minimax_m2"
+    assert all(layer["n_groups"] == 1 for layer in am_payload["layers"].values())
+
+    report = compare_glm_router_captures(
+        hf_path,
+        am_path,
+        report_path,
+        reference_logits=hf_logits,
+        candidate_logits=am_logits,
+    )
+    assert report["model_family"] == "minimax_m2"
+    assert report["layer_count"] == 2
+    assert 0.0 <= report["route_flip_token_fraction"] <= 1.0
+    assert json.loads(report_path.read_text())["layer_count"] == 2

@@ -207,7 +207,10 @@ def capture_glm_automodel_routers(model: torch.nn.Module, output_path: Path) -> 
                 "correction_bias": correction_bias.detach(),
                 "indices": indices.detach(),
                 "score_func": self.score_func,
-                "n_groups": self.n_groups,
+                # MiniMax-style configs express "no group limiting" as
+                # n_expert_groups=0; normalize to the 1-group form the compare
+                # step requires.
+                "n_groups": max(int(self.n_groups), 1),
             }
             return result
 
