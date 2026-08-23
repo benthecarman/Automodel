@@ -46,13 +46,18 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _persist_capture(path: Path, framework: str, captures: dict[int, dict[str, object]]) -> None:
+def _model_family(model: torch.nn.Module) -> str:
+    """Return the captured model's family from its config ``model_type``."""
+    return str(getattr(getattr(model, "config", None), "model_type", "") or "unknown")
+
+
+def _persist_capture(path: Path, framework: str, captures: dict[int, dict[str, object]], model_family: str) -> None:
     if not captures:
-        raise RuntimeError(f"No {framework} GLM router calls were captured")
+        raise RuntimeError(f"No {framework} router calls were captured")
     payload = {
         "schema_version": 1,
         "framework": framework,
-        "model_family": "glm4_moe_lite",
+        "model_family": model_family,
         "layers": {
             layer_index: {
                 "router_logits": _local_tensor(layer["router_logits"]).to(device="cpu", dtype=torch.float32),
@@ -86,48 +91,82 @@ def capture_glm_hf_routers(model: torch.nn.Module, output_path: Path) -> Iterato
         return
 
     captures: dict[int, dict[str, object]] = {}
-    patched_modules: list[tuple[torch.nn.Module, bool, object | None]] = []
+    patched_modules: list[tuple[torch.nn.Module, str, bool, object | None]] = []
     for module_name, module in model.named_modules():
-        if module.__class__.__name__ != "Glm4MoeLiteMoE":
-            continue
-        layer_index = _layer_index(module_name)
-        original_route = module.route_tokens_to_experts
-        had_instance_override = "route_tokens_to_experts" in module.__dict__
-        original_instance_value = module.__dict__.get("route_tokens_to_experts")
+        class_name = module.__class__.__name__
+        if class_name == "Glm4MoeLiteMoE":
+            layer_index = _layer_index(module_name)
+            original_route = module.route_tokens_to_experts
+            had_instance_override = "route_tokens_to_experts" in module.__dict__
+            original_instance_value = module.__dict__.get("route_tokens_to_experts")
 
-        def capture_route(self, router_logits, *args, _original=original_route, _layer=layer_index, **kwargs):
-            result = _original(router_logits, *args, **kwargs)
-            indices, _weights = result
-            correction_bias = self.gate.e_score_correction_bias
-            if correction_bias is None:
-                correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
-            captures[_layer] = {
-                "router_logits": router_logits.detach(),
-                "correction_bias": correction_bias.detach(),
-                "indices": indices.detach(),
-                "score_func": "sigmoid",
-                "n_groups": int(getattr(self.config, "n_group", 1)),
-            }
-            return result
+            def capture_route(self, router_logits, *args, _original=original_route, _layer=layer_index, **kwargs):
+                result = _original(router_logits, *args, **kwargs)
+                indices, _weights = result
+                correction_bias = self.gate.e_score_correction_bias
+                if correction_bias is None:
+                    correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
+                captures[_layer] = {
+                    "router_logits": router_logits.detach(),
+                    "correction_bias": correction_bias.detach(),
+                    "indices": indices.detach(),
+                    "score_func": "sigmoid",
+                    "n_groups": int(getattr(self.config, "n_group", 1)),
+                }
+                return result
 
-        module.route_tokens_to_experts = MethodType(capture_route, module)
-        patched_modules.append((module, had_instance_override, original_instance_value))
+            module.route_tokens_to_experts = MethodType(capture_route, module)
+            patched_modules.append((module, "route_tokens_to_experts", had_instance_override, original_instance_value))
+        elif class_name == "MiniMaxM2TopKRouter":
+            # In-tree Transformers MiniMax-M2: the router computes logits from
+            # hidden states and returns (router_logits, router_scores,
+            # top_k_index); the correction bias arrives as its second argument.
+            layer_index = _layer_index(module_name)
+            original_forward = module.forward
+            had_instance_override = "forward" in module.__dict__
+            original_instance_value = module.__dict__.get("forward")
+
+            def capture_minimax_forward(
+                self,
+                hidden_states,
+                e_score_correction_bias,
+                *args,
+                _original=original_forward,
+                _layer=layer_index,
+                **kwargs,
+            ):
+                router_logits, router_scores, top_k_index = _original(
+                    hidden_states, e_score_correction_bias, *args, **kwargs
+                )
+                captures[_layer] = {
+                    "router_logits": router_logits.detach(),
+                    "correction_bias": e_score_correction_bias.detach(),
+                    "indices": top_k_index.detach(),
+                    "score_func": "sigmoid",
+                    "n_groups": 1,
+                }
+                return router_logits, router_scores, top_k_index
+
+            module.forward = MethodType(capture_minimax_forward, module)
+            patched_modules.append((module, "forward", had_instance_override, original_instance_value))
 
     if not patched_modules:
-        raise ValueError("capture_router_diagnostics currently supports only vanilla-HF Glm4MoeLiteMoE models")
+        raise ValueError(
+            "capture_router_diagnostics currently supports only vanilla-HF Glm4MoeLiteMoE or MiniMaxM2TopKRouter models"
+        )
 
     completed = False
     try:
         yield
         completed = True
     finally:
-        for module, had_instance_override, original_instance_value in patched_modules:
+        for module, attribute_name, had_instance_override, original_instance_value in patched_modules:
             if had_instance_override:
-                module.route_tokens_to_experts = original_instance_value
+                setattr(module, attribute_name, original_instance_value)
             else:
-                delattr(module, "route_tokens_to_experts")
+                delattr(module, attribute_name)
         if completed:
-            _persist_capture(output_path, "hf", captures)
+            _persist_capture(output_path, "hf", captures, _model_family(model))
 
 
 @contextmanager
@@ -189,7 +228,7 @@ def capture_glm_automodel_routers(model: torch.nn.Module, output_path: Path) -> 
             else:
                 delattr(module, "_route_scores")
         if completed:
-            _persist_capture(output_path, "automodel", captures)
+            _persist_capture(output_path, "automodel", captures, _model_family(model))
 
 
 def _quantiles(values: torch.Tensor) -> dict[str, float] | None:
@@ -474,7 +513,7 @@ def compare_glm_router_captures(
     }
     report: dict[str, object] = {
         "schema_version": 2,
-        "model_family": "glm4_moe_lite",
+        "model_family": hf_capture.get("model_family", "unknown"),
         "comparison": "hf_source_vs_automodel_source",
         "layer_count": len(layer_metrics),
         "layer_token_count": total_layer_tokens,

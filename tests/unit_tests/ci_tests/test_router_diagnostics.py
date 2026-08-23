@@ -105,3 +105,49 @@ def test_router_shape_report_attributes_kl_to_sustained_self_flips(tmp_path):
     assert report["tokens_with_sustained_flips_count"] == 1
     assert report["sustained_flip_final_token_kl"]["token_count"] == 1
     assert report["sustained_flip_final_token_kl"]["mean_kl"] > 1.0
+
+
+def test_capture_hf_routers_supports_in_tree_minimax_m2(tmp_path):
+    """The HF capture must wrap in-tree MiniMaxM2TopKRouter modules.
+
+    MiniMax expresses routing as router.forward(hidden_states, bias) ->
+    (router_logits, router_scores, top_k_index), unlike GLM's
+    route_tokens_to_experts(router_logits) hook.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from tests.functional_tests.checkpoint_robustness.router_diagnostics import capture_glm_hf_routers
+
+    config = AutoConfig.for_model(
+        "minimax_m2",
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        rotary_dim=16,
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        max_position_embeddings=128,
+    )
+    model = AutoModelForCausalLM.from_config(config).float().eval()
+    capture_path = tmp_path / "hf.pt"
+    # input_ids: Tensor of shape [batch, sequence] with 8 tokens.
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+
+    with capture_glm_hf_routers(model, capture_path):
+        with torch.no_grad():
+            model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+
+    payload = torch.load(capture_path, weights_only=True)
+    assert payload["model_family"] == "minimax_m2"
+    assert set(payload["layers"]) == {0, 1}
+    layer = payload["layers"][0]
+    assert layer["router_logits"].shape == (8, 8)
+    assert layer["correction_bias"].shape == (8,)
+    assert layer["indices"].shape == (8, 2)
+    assert layer["score_func"] == "sigmoid"
+    # The instance patch is removed once the capture context exits.
+    assert "forward" not in model.model.layers[0].mlp.gate.__dict__

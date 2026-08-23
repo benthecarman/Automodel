@@ -162,7 +162,7 @@ localized the full-sequence tail to a framework-sensitive numerical path, such a
 do not use it as a general substitute for fixing a model or selecting the appropriate tolerance profile.
 
 `capture_router_diagnostics: true` additionally records the full-sequence vanilla-HF and AutoModel router logits,
-correction biases, and actual expert selections during Phase 0 for GLM 4.7 Flash. Its concise CI summary focuses on
+correction biases, and actual expert selections during Phase 0 for GLM 4.7 Flash and MiniMax M2. Its concise CI summary focuses on
 layers 1-5: route-flip context, large-margin flips outside the measured score-noise band, and whether replacement
 experts systematically follow correction bias. Flip counts never gate because a stable MoE can flip many near ties.
 The full report also groups final-token KL by flipped-layer count, separating the zero-flipped-layer empirical floor
