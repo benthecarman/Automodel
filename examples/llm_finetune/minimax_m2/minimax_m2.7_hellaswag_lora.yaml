@@ -52,7 +52,11 @@ model:
     attn: te
     linear: torch
     rms_norm: torch_fp32
-    rope_fusion: true
+    # Match the MiniMax-M2 PP recipes: run RoPE unfused. The fused-TE
+    # partial-rotary path (rotary_dim 64 of head_dim 128) is the remaining
+    # MiniMax-unique forward difference under the AMINT-286 cross-framework
+    # residual; this recipe A/Bs it against the vanilla-HF reference.
+    rope_fusion: false
     dispatcher: hybridep
     experts: gmm
     fake_balanced_gate: false
